@@ -1,0 +1,84 @@
+name: Sync with upstream and rebuild
+
+# Tracks the upstream fork (pewdiepie-archdaemon/odysseus) for the homelab deploy.
+#
+# Every 6h: rebase our CI-only commits onto upstream/main, rebuild the multi-arch
+# GHCR image, then force-push main. The image is built BEFORE the push on purpose:
+# the Komodo deploy webhook fires on push, so building first guarantees the new
+# :main image is already in GHCR when Komodo pulls (no stale-image race).
+#
+# Our fork only ADDS files upstream never touches (.github/workflows/*, gitignored
+# static/icon-*.png), so the rebase replays cleanly with no conflicts.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours (UTC)
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync-and-rebuild:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebase onto upstream/main
+        id: rebase
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/pewdiepie-archdaemon/odysseus.git
+          git fetch --no-tags upstream main
+          before=$(git rev-parse HEAD)
+          git rebase upstream/main
+          after=$(git rev-parse HEAD)
+          if [ "$before" = "$after" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Already up to date with upstream — nothing to rebuild."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Rebased onto upstream/main ($before -> $after)."
+          fi
+
+      - name: Set up QEMU
+        if: steps.rebase.outputs.changed == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.rebase.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.rebase.outputs.changed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Hardcode the :main tag — metadata-action would emit :nightly on a
+      # scheduled event, but Komodo always pulls ghcr.io/noahkiss/odysseus:main.
+      - name: Build and push image
+        if: steps.rebase.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository }}:main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Push LAST: the deploy webhook fires here, image is already in GHCR.
+      - name: Push rebased main (fires deploy webhook)
+        if: steps.rebase.outputs.changed == 'true'
+        run: git push --force-with-lease origin main
